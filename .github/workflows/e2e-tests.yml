@@ -1,0 +1,147 @@
+name: E2E Tests
+
+on:
+  workflow_call:
+    inputs:
+      test-plan-artifact-id:
+        description: "ID of this run's test-plan.json artifact, '' to run the full suite."
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}-e2e
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    uses: ./.github/workflows/test.gate.yml
+    with:
+      filters: e2e_all
+
+  e2e-matrix-builder:
+    needs: gate
+    if: ${{ needs.gate.outputs.run == 'true' }}
+    uses: ./.github/workflows/e2e-matrix-builder.yml
+    with:
+      chunks: 50
+      test-plan-artifact-id: ${{ inputs.test-plan-artifact-id }}
+
+  e2e-tests:
+    name: ${{ matrix.name }}-${{ matrix.edition }}
+    uses: ./.github/workflows/e2e-test.yml
+    needs:
+      - e2e-matrix-builder
+    # No status function, so a skipped or failed matrix builder keeps this out: the strategy below
+    # cannot parse a matrix it never produced. The builder itself only runs when the gate says so.
+    if: ${{ needs.e2e-matrix-builder.outputs.hasTests == 'true' }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.e2e-matrix-builder.outputs.matrix) }}
+    secrets: inherit
+    with:
+      name: ${{ matrix.name }}
+      edition: ${{ matrix.edition }}
+      specs: ${{ matrix.specs }}
+      test-plan-artifact-id: ${{ needs.e2e-matrix-builder.outputs.test-plan-artifact-id }}
+      total_chunks: ${{ fromJson(needs.e2e-matrix-builder.outputs.regularChunks) }}
+      split_index: ${{ strategy.job-index }}
+      tags: ${{ matrix.tags }}
+      runner: ${{ matrix.runner }}
+
+  collect-timings:
+    name: Collect E2E Timings
+    runs-on: ${{ vars.DEFAULT_RUNNER_KEY }}
+    timeout-minutes: 10
+    needs: e2e-tests
+    if: ${{ !cancelled() && github.ref == 'refs/heads/master' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            .github
+            e2e/support
+          sparse-checkout-cone-mode: false
+
+      - name: Download all timing artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: timing-data-*
+          path: timing-files
+          merge-multiple: false
+        continue-on-error: true
+
+      - name: Merge split timings
+        id: merge
+        continue-on-error: true
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const globber = await glob.create('timing-files/*/chunkTimings.json');
+            const chunkFiles = await globber.glob();
+
+            const specs = new Map();
+            chunkFiles.forEach(file => {
+              const { durations = [] } = JSON.parse(fs.readFileSync(file, 'utf8'));
+              durations.forEach(({ spec, duration }) => specs.set(spec, duration));
+            });
+
+            if (specs.size === 0) {
+              throw new Error('No timing data found - no specs had timing changes');
+            }
+
+            const outputPath = 'e2e/support/runTimings.json';
+            fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+
+            const runTimings = {
+              durations: [...specs].map(([spec, duration]) => ({ spec, duration }))
+            };
+
+            fs.writeFileSync(outputPath, JSON.stringify(runTimings, null, 2));
+            console.log(`Merged timing data for ${specs.size} specs`);
+
+      - name: Upload merged timing files
+        if: steps.merge.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: merged-e2e-timings
+          path: e2e/support/runTimings.json
+          retention-days: 7
+
+  e2e-tests-result:
+    needs:
+      - gate
+      - e2e-matrix-builder
+      - e2e-tests
+    runs-on: ${{ vars.SLIM_RUNNER_KEY }}
+    timeout-minutes: 5
+    name: e2e-tests-result
+    if: ${{ !cancelled() }}
+    env:
+      E2E_TESTS_RESULT: ${{ needs.e2e-tests.result }}
+      MATRIX_RESULT: ${{ needs.e2e-matrix-builder.result }}
+      HAS_TESTS: ${{ needs.e2e-matrix-builder.outputs.hasTests }}
+      GATE_RESULT: ${{ needs.gate.result }}
+      RUN: ${{ needs.gate.outputs.run }}
+    steps:
+      - name: Test results
+        run: | # sh
+          if [ "$GATE_RESULT" != "success" ]; then
+            echo "The test gate failed, so the suite never ran"
+            exit 1
+          elif [ "$RUN" != "true" ]; then
+            echo "Didn't run due to conditional filtering"
+          elif [ "$MATRIX_RESULT" != "success" ]; then
+            echo "E2E matrix builder failed"
+            exit 1
+          elif [ "$HAS_TESTS" = "false" ]; then
+            echo "The plan selected no E2E specs"
+          elif [ "$E2E_TESTS_RESULT" != "success" ]; then
+            echo "E2E Tests failed"
+            exit 1
+          else
+            echo "E2E Tests passed"
+          fi
